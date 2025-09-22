@@ -1,0 +1,29 @@
+numpy==1.23.5
+pandas==1.5.2
+scipy==1.9.3
+scikit-learn==1.1.3
+torch==1.13.1
+torchvision==0.14.1
+matplotlib==3.6.2
+seaborn==0.12.1
+tqdm==4.64.1
+# Required for data processing
+joblib==1.2.0
+# Required for visualization
+pillow==9.3.0
+# Required for handling medical data formats
+pydicom==2.3.1
+# Required for efficient data manipulation
+h5py==3.7.0
+# Optional: for notebook usage
+jupyter==1.0.0
+ipywidgets==8.0.4
+# Optional: for progress tracking
+wandb==0.13.7
+# Required for file operations
+pathlib==1.0.1
+# Optional: for statistical tests
+statsmodels==0.13.5
+# For handling MIMIC data
+psycopg2-binary==2.9.5
+google-cloud-bigquery==3.4.0
