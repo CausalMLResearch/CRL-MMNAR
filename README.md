@@ -92,29 +92,3 @@ This script will:
 * Apply the rectifier correction to adjust for modality-specific biases
 * Generate enhanced prediction results in `enhanced_results_selective_results.csv`
 * Create performance comparison charts (`enhanced_results_roc.png` and `enhanced_results_pr.png`)
-
-## Model Architecture Details
-
-### MMNAR-Aware Modality Fusion
-
-The `multimodal_missingness.py` file implements our MMNAR-aware modality fusion module, which:
-
-* Computes a missingness embedding that encodes the modality availability pattern
-* Uses gated fusion to adaptively integrate modality-specific embeddings
-* Applies a transformer-based fusion mechanism to contextualize modalities
-
-### Representation Balancing Module
-
-Also implemented in `multimodal_missingness.py`, this module:
-
-* Uses cross-modal reconstruction to retain semantic information across missingness patterns
-* Applies contrastive learning to align representations
-* Incorporates missingness calibration to improve generalization
-
-### Multitask Outcome Prediction with Rectifier
-
-The `apply_rectifier.py` script implements our rectifier correction approach:
-
-* Estimates group-wise prediction bias for each modality pattern
-* Applies selective correction based on performance improvement
-* Corrects for residual biases in final predictions
