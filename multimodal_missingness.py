@@ -43,9 +43,9 @@ USE_AMP = False
 #########################################
 class Config:
     # Data paths
-    DATA_ROOT = "mimiciv_data/final_dataset"
+    DATA_ROOT = "mimiciv_data"
     CXR_PATH = os.path.join(DATA_ROOT, "cxr_embeddings_aggregated.csv")
-    FEATURES_PATH = os.path.join(DATA_ROOT, "patient_features_final_corrected.csv")
+    FEATURES_PATH = os.path.join(DATA_ROOT, "patient_features_noleak.csv")
     TEXT_PATH = os.path.join(DATA_ROOT, "patient_text_embeddings_nan.csv")
     OUTPUT_DIR = "outputs_model"
     FIGURE_DIR = os.path.join(OUTPUT_DIR, "figures")
