@@ -61,7 +61,7 @@ def apply_direct_correction_correction(predictions, use_selective_correction=Fal
     """Apply correction directly to saved predictions
     
     Args:
-        predictions: Prediction dictionary containing 'readm_preds', 'readm_targets', 'icu_preds', 'icu_targets', 'missing_flags', etc.
+        predictions: Prediction dictionary containing 30-day readmission and 90-day ICU targets/predictions, plus missing_flags, etc.
         use_selective_correction: Whether to use selective correction
         
     Returns:
@@ -688,9 +688,10 @@ def apply_direct_correction_correction(predictions, use_selective_correction=Fal
         if ensemble_icu_auc > roc_auc_score(icu_targets, corrected_icu_preds):
             print("Using ICU ensemble correction results (better performance)")
             corrected_icu_preds = final_icu_ensemble_preds
-            corrected_icu_auc = ensemble_icu_auc
-            corrected_icu_apr = ensemble_icu_apr
-            corrected_icu_brier = ensemble_icu_brier
+
+        # Metrics for the iteration must reflect the final ICU predictions after
+        # optional ensemble replacement.
+        current_icu_auc = roc_auc_score(icu_targets, corrected_icu_preds)
         
         # Save current iteration results
         iteration_results.append({
@@ -813,9 +814,6 @@ def apply_direct_correction_correction(predictions, use_selective_correction=Fal
     if ensemble_auc > roc_auc_score(readm_targets, corrected_readm_preds):
         print("Using ensemble correction results (better performance)")
         corrected_readm_preds = final_ensemble_preds
-        corrected_readm_auc = ensemble_auc
-        corrected_readm_apr = ensemble_apr
-        corrected_readm_brier = ensemble_brier
     else:
         # Select results from best iteration
         best_iteration = np.argmax([r['readm_auc'] for r in iteration_results])
@@ -827,14 +825,16 @@ def apply_direct_correction_correction(predictions, use_selective_correction=Fal
         corrected_readm_preds = all_iterations_preds['readm'][best_iteration+1]
         corrected_icu_preds = all_iterations_preds['icu'][best_iteration+1]
 
-        # Calculate metrics after correction
-        corrected_readm_auc = roc_auc_score(readm_targets, corrected_readm_preds)
-        corrected_readm_apr = average_precision_score(readm_targets, corrected_readm_preds)
-        corrected_readm_brier = brier_score_loss(readm_targets, corrected_readm_preds)
-        
-        corrected_icu_auc = roc_auc_score(icu_targets, corrected_icu_preds)
-        corrected_icu_apr = average_precision_score(icu_targets, corrected_icu_preds)
-        corrected_icu_brier = brier_score_loss(icu_targets, corrected_icu_preds)
+
+    # Calculate metrics from the final prediction arrays unconditionally. This
+    # avoids stale or uninitialized metric variables when readmission and ICU
+    # ensemble selections take different branches.
+    corrected_readm_auc = roc_auc_score(readm_targets, corrected_readm_preds)
+    corrected_readm_apr = average_precision_score(readm_targets, corrected_readm_preds)
+    corrected_readm_brier = brier_score_loss(readm_targets, corrected_readm_preds)
+    corrected_icu_auc = roc_auc_score(icu_targets, corrected_icu_preds)
+    corrected_icu_apr = average_precision_score(icu_targets, corrected_icu_preds)
+    corrected_icu_brier = brier_score_loss(icu_targets, corrected_icu_preds)
     
     print("\nCalculating corrected metrics...")
     
@@ -950,9 +950,9 @@ def apply_correction_to_saved_csv(csv_path, use_selective_correction=False, outp
     print(f"Readmission AUC: {original_readm_auc:.4f}")
     print(f"Readmission APR: {original_readm_apr:.4f}")
     print(f"Readmission Brier: {original_readm_brier:.4f}")
-    print(f"ICU AUC: {original_icu_auc:.4f}")
-    print(f"ICU APR: {original_icu_apr:.4f}")
-    print(f"ICU Brier: {original_icu_brier:.4f}")
+    print(f"ICU 90d AUC: {original_icu_auc:.4f}")
+    print(f"ICU 90d APR: {original_icu_apr:.4f}")
+    print(f"ICU 90d Brier: {original_icu_brier:.4f}")
     
     # Apply correction
     print("\nApplying correction to saved predictions...")

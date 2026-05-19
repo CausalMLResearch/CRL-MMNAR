@@ -408,18 +408,22 @@ class RectifierCorrector:
                 # Correction for edge regions - more refined adjustments
                 if np.any(edge_mask):
                     # Create different edge regions for differential treatment
-                    extreme_edge = (missing_preds[edge_mask] < 0.2) | (missing_preds[edge_mask] > 0.8)
+                    edge_indices = np.where(edge_mask)[0]
+                    edge_preds = missing_preds[edge_indices]
+                    extreme_edge = (edge_preds < 0.2) | (edge_preds > 0.8)
                     moderate_edge = ~extreme_edge
                     
                     # Appropriate correction for extreme edges
                     if np.any(extreme_edge):
-                        extreme_adjustment = np.sign(missing_preds[edge_mask][extreme_edge] - 0.5) * 0.01
-                        missing_preds[edge_mask][extreme_edge] += extreme_adjustment
+                        extreme_indices = edge_indices[extreme_edge]
+                        extreme_adjustment = np.sign(missing_preds[extreme_indices] - 0.5) * 0.01
+                        missing_preds[extreme_indices] += extreme_adjustment
                     
                     # Enhanced correction for moderate edges
                     if np.any(moderate_edge):
-                        moderate_adjustment = np.sign(missing_preds[edge_mask][moderate_edge] - 0.5) * 0.03
-                        missing_preds[edge_mask][moderate_edge] += moderate_adjustment
+                        moderate_indices = edge_indices[moderate_edge]
+                        moderate_adjustment = np.sign(missing_preds[moderate_indices] - 0.5) * 0.03
+                        missing_preds[moderate_indices] += moderate_adjustment
                 
                 # Update corrected predictions
                 corrected[mask] = missing_preds
