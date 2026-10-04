@@ -595,10 +595,6 @@ class CRLMMNARFinal(nn.Module):
         self.cfg = cfg
         self.encoders = nn.ModuleList([ModalityEncoder(dim, cfg.hidden_dim, cfg.dropout) for dim in input_dims])
         self.fusion = MissingnessAwareFusion(cfg.hidden_dim, cfg.attention_heads, cfg.dropout)
-        # Preserve the official model's direct [S, I, T, R, z] path.  A
-        # learnable residual blend lets the existing attention representation
-        # remain the stable starting point while the concatenation path earns a
-        # larger or smaller contribution during training.
         self.initial_fusion = nn.Sequential(
             nn.Linear(cfg.hidden_dim * 5, cfg.hidden_dim * 2),
             nn.LayerNorm(cfg.hidden_dim * 2), nn.GELU(), nn.Dropout(cfg.dropout),
@@ -646,8 +642,6 @@ class CRLMMNARFinal(nn.Module):
         return [encoder(value) for encoder, value in zip(self.encoders, values)]
 
     def task_logit(self, task: str, h: torch.Tensor) -> torch.Tensor:
-        # In the manuscript's simplified outcome model the base head is g(h);
-        # direct pattern effects are reserved for the cross-fitted rectifier.
         adapted = self.task_adapters[task](h)
         return self.heads[task](adapted)
 
@@ -751,9 +745,6 @@ class CRLMMNARFinal(nn.Module):
         reconstruction_terms: List[torch.Tensor] = []
         contrastive_terms: List[torch.Tensor] = []
         for modality in range(4):
-            # Exhaustive leave-one-observed-modality-out is the deterministic
-            # minibatch estimator of Algorithm 2 and gives rare CXR patterns
-            # enough positives for stable InfoNCE.
             selected = eligible & flags[:, modality].bool()
             if not selected.any():
                 continue

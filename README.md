@@ -28,7 +28,7 @@ Before running the pipeline, prepare the local data directories below. By defaul
 
 `preprocess.py` downloads the required MIMIC-IV v3.1 structured tables from the BigQuery datasets under `physionet-data`. Configure Google Cloud application-default credentials with access to PhysioNet BigQuery before running the script.
 
-Set both `gcp_project` values in `preprocess.py` to your billing project (the current default is `mimic-project-01`), or set them to `None` to use the project from your default credentials. Configuration is defined in the script; there is no `--gcp-project` command-line option.
+Replace both `YOUR_GCP_PROJECT_ID` placeholders in `preprocess.py` with your billing project ID, or set both `gcp_project` values to `None` to use the project from your default credentials. Configuration is defined in the script; there is no `--gcp-project` command-line option.
 
 ### MIMIC-CXR Image Embeddings
 

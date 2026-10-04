@@ -17,7 +17,7 @@ def main() -> None:
         note_dir=str(root.parent / "mimiciv_note"),
         cxr_dir=str(root.parent / "mimiciv_cxr"),
         cohort_size=20000, random_seed=42, observation_hours=24,
-        protocol="icu_landmark", gcp_project="mimic-project-01",
+        protocol="icu_landmark", gcp_project="YOUR_GCP_PROJECT_ID",
         bq_page_size=50000, csv_chunksize=250000,
     )
     post = SimpleNamespace(
@@ -25,7 +25,7 @@ def main() -> None:
         note_dir=str(root.parent / "mimiciv_note"),
         cxr_dir=str(root.parent / "mimiciv_cxr"),
         cohort_size=20000, random_seed=42, note_grace_hours=24,
-        gcp_project="mimic-project-01", bq_page_size=50000, csv_chunksize=250000,
+        gcp_project="YOUR_GCP_PROJECT_ID", bq_page_size=50000, csv_chunksize=250000,
         text_model="emilyalsentzer/Bio_ClinicalBERT", text_batch_size=8,
         text_chunk_stride=384, note_chunksize=5000,
         text_cache_dir=str(root.parent / "mimiciv_data/text_embedding_cache"),
