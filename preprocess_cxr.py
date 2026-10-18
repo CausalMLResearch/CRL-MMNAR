@@ -60,7 +60,7 @@ def load_prediction_subject_ids(data_dir: str) -> List[int]:
     selected_path = os.path.join(data_dir, "selected_subject_ids.csv")
     meta_path = os.path.join(data_dir, "patient_features.meta.json")
     for path, description in (
-        (cohort_path, "ICU landmark cohort manifest"),
+        (cohort_path, "analysis cohort manifest"),
         (features_path, "structured patient features"),
         (selected_path, "selected subject list"),
         (meta_path, "structured-stage metadata"),
@@ -105,7 +105,7 @@ def load_cohort(
     subject_ids: List[int],
 ) -> pd.DataFrame:
     cohort_path = os.path.join(data_dir, "analysis_cohort.csv")
-    require_nonempty_file(cohort_path, "ICU landmark cohort manifest")
+    require_nonempty_file(cohort_path, "analysis cohort manifest")
 
     cohort = pd.read_csv(
         cohort_path,
@@ -129,7 +129,7 @@ def load_cohort(
             f"analysis_cohort.csv is missing {len(missing_subjects)} prediction subjects"
         )
     if cohort[["admittime", "dischtime", "intime", "prediction_cutoff"]].isna().any().any():
-        raise ValueError("Cohort contains missing ICU observation-window timestamps")
+        raise ValueError("Cohort contains missing observation timestamps")
 
     return cohort.sort_values("subject_id").reset_index(drop=True)
 
@@ -246,7 +246,7 @@ def patient_records(
     timeline: pd.DataFrame,
 ) -> pd.DataFrame:
     timeline = timeline.merge(
-        cohort[["subject_id", "admittime", "dischtime", "intime", "prediction_cutoff"]],
+        cohort[["subject_id"]],
         on="subject_id",
         how="inner",
         validate="many_to_one",
@@ -259,7 +259,7 @@ def extract_subject_embeddings(
     timeline: pd.DataFrame,
     embedding_dir: str,
 ) -> Tuple[List[Tuple[int, List[List[float]]]], int]:
-    columns = ["dicom_id", "subject_id", "study_id", "study_datetime"]
+    columns = ["dicom_id", "subject_id", "study_id"]
     timeline = patient_records(cohort, timeline[columns])
     eligible_by_subject = {
         int(subject_id): set(
@@ -459,8 +459,6 @@ def write_embeddings(args, cohort, records) -> None:
         "cohort_subjects": len(cohort),
         "embedded_subjects": aggregated_subjects,
     }
-    if structured_metadata.get("pipeline") == "icu_landmark":
-        payload["window"] = "landmark" if "cxr_embeddings_early" in os.path.basename(args.output_csv) else "hospital"
     with open(temp_meta, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(temp_meta, output_meta)
@@ -473,25 +471,12 @@ def build_embeddings(args) -> None:
     write_embeddings(args, cohort, records)
 
 
-def build_mortality_embeddings(args) -> None:
-    from preprocess_mortality import cxr_views
-    from types import SimpleNamespace
-    cohort, records = prepare_inputs(args)
-    if (cohort.prediction_cutoff < cohort.intime).any():
-        raise ValueError("Cohort contains a prediction cutoff before ICU intime")
-    for stem, selected in cxr_views(cohort, records).items():
-        output = SimpleNamespace(**vars(args))
-        output.intermediate_csv = os.path.join(args.data_dir, f"{stem}_by_file.csv")
-        output.output_csv = os.path.join(args.data_dir, f"{stem}_aggregated.csv")
-        write_embeddings(output, cohort, selected)
-
-
 
 def main() -> None:
     from pathlib import Path
     from types import SimpleNamespace
     root = Path(__file__).resolve().parent
-    for cohort in ("mortality", "post_discharge"):
+    for cohort in ("post_discharge",):
         data = root / "data" / cohort
         args = SimpleNamespace(
             data_dir=str(data), embedding_dir=str(root.parent / "mimiciv_cxr"),
@@ -499,10 +484,7 @@ def main() -> None:
             output_csv=str(data / "cxr_embeddings_aggregated.csv"),
             metadata_path=None, split_path=None, frontal_only=True,
         )
-        if cohort == "mortality":
-            build_mortality_embeddings(args)
-        else:
-            build_embeddings(args)
+        build_embeddings(args)
 
 
 if __name__ == "__main__":

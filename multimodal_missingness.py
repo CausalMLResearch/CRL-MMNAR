@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train readmission, ICU and independent ICU-landmark mortality models."""
+"""Predict readmission, ICU and 90-day mortality from common discharge inputs."""
 
 from __future__ import annotations
 
@@ -17,21 +17,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import RobustScaler
+from threadpoolctl import threadpool_limits
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from rectifier import json_safe, rectify
+from preprocess_mortality import MORTALITY_DEFINITION, MORTALITY_LABEL
 
 
 TASKS = ("readmission", "icu", "mortality")
 LABELS = {
     "readmission": "readmission_30d",
     "icu": "icu_need_after_discharge_90d",
-    "mortality": "in_hospital_mortality",
+    "mortality": MORTALITY_LABEL,
 }
 AUXILIARY_LABELS = {"readmission_90d": "readmission_90d"}
 MODALITIES = ("struct", "img", "text", "rad")
+
+
+@dataclass(frozen=True)
+class ReaderPolicy:
+    coverage: Tuple[float, float]
+    projection: float = 0.0
+    criterion: Tuple[float, float] = (0.7, 0.3)
+    patience: int = 20
+    seed: int = 20261004
+    draws: int = 16000
+
+    @classmethod
+    def for_task(cls, task: str) -> ReaderPolicy:
+        return {
+            "readmission": cls((0.297, 0.347), patience=100),
+            "icu": cls((0.200, 0.475), projection=0.7, criterion=(1.0, 0.0)),
+            "mortality": cls((0.100, 0.250)),
+        }[task]
 
 
 @dataclass
@@ -63,15 +85,12 @@ class TrainConfig:
             raise ValueError(f"Unknown task: {self.task}")
         root = Path(__file__).resolve().parent
         mortality = self.task == "mortality"
-        self.data_dir = str(root / "data" / ("mortality" if mortality else "post_discharge"))
+        self.data_dir = str(root / "data" / "post_discharge")
         self.output_dir = str(root / "outputs" / "model" / self.task)
-        self.patience = 20 if mortality else 100
+        self.reader_policy = ReaderPolicy.for_task(self.task)
+        self.patience = self.reader_policy.patience
         self.relationship_weight = 0.0 if mortality else 0.3
         self.conditional_icu_weight = 0.0 if mortality else 0.5
-        if not mortality:
-            self.class_keep = (0.297, 0.347) if self.task == "readmission" else (0.666, 0.666)
-            self.index_seed = 20261004
-            self.epoch_size = 16000
 
 
 def set_seed(seed: int) -> None:
@@ -125,129 +144,10 @@ def load_embedding_matrix(path: Path, ids: np.ndarray, column: str) -> Tuple[np.
 
 class DataBundle:
     def __init__(self, data_dir: str, task: Optional[str] = None, post_view: str = "complete"):
-        root = Path(data_dir)
+        if task is not None and task not in TASKS:
+            raise ValueError(f"Unknown task: {task}")
         self.post_view = post_view
-        self.split_on_missingness = True
-        post_metadata = root / f"patient_features_discharge_{post_view}.meta.json"
-        if post_metadata.is_file():
-            if task == "mortality":
-                raise ValueError("Mortality must use the ICU+24h data directory")
-            self._load_post_discharge(root, post_view)
-            return
-        view_specs = {
-            "early": (root / "patient_features_early.csv", root / "patient_features_early.meta.json", "early_24h"),
-            "discharge": (root / "patient_features_discharge.csv", root / "patient_features_discharge.meta.json", "discharge"),
-        }
-        metadata_by_view: Dict[str, Dict[str, object]] = {}
-        for view, (_, metadata_path, expected_view) in view_specs.items():
-            if not metadata_path.is_file():
-                raise FileNotFoundError(f"Missing preprocessing metadata: {metadata_path}")
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if metadata.get("structured_pipeline") != "icu_dual_view" or metadata.get("view") != expected_view:
-                raise ValueError(f"{metadata_path} is not the expected {view} view")
-            metadata_by_view[view] = metadata
-        fingerprint = metadata_by_view["early"].get("cohort_fingerprint")
-        if not isinstance(fingerprint, str) or not fingerprint:
-            raise ValueError("Structured preprocessing metadata has no cohort fingerprint")
-        if metadata_by_view["discharge"].get("cohort_fingerprint") != fingerprint:
-            raise ValueError("Early and discharge structured views belong to different cohorts")
-        self.fingerprint = fingerprint
-        for artifact in (
-            "patient_text_embeddings.meta.json",
-            "cxr_embeddings_aggregated.meta.json",
-            "cxr_embeddings_early_aggregated.meta.json",
-        ):
-            artifact_path = root / artifact
-            if not artifact_path.is_file():
-                raise FileNotFoundError(f"Missing embedding metadata: {artifact_path}")
-            artifact_metadata = json.loads(artifact_path.read_text(encoding="utf-8"))
-            if artifact_metadata.get("cohort_fingerprint") != fingerprint:
-                raise ValueError(f"{artifact} belongs to a different cohort")
-            if (
-                artifact == "patient_text_embeddings.meta.json"
-                and (
-                    artifact_metadata.get("text_pipeline") != "icu_dual_view"
-                    or artifact_metadata.get("post_discharge_cutoff")
-                    != "charttime_and_storetime_at_or_before_index_discharge"
-                )
-            ):
-                raise ValueError("Text embeddings are stale; rerun the  text stage")
-        required = {"subject_id", "post_discharge_observed", *LABELS.values()}
-        frames: Dict[str, pd.DataFrame] = {}
-        for view, (data_path, _, _) in view_specs.items():
-            structured = pd.read_csv(data_path).sort_values("subject_id").reset_index(drop=True)
-            missing = sorted(required - set(structured.columns))
-            if missing:
-                raise ValueError(f"{data_path} is missing required columns: {missing}")
-            if structured.subject_id.duplicated().any():
-                raise ValueError(f"{data_path} contains duplicate subjects")
-            forbidden_tokens = ["hospital_expire_flag", "deathtime"]
-            if view == "early":
-                forbidden_tokens.extend(["discharge_location", "hospital_duration", "icu_duration"])
-            forbidden = [c for c in structured if any(x in c.lower() for x in forbidden_tokens)]
-            if forbidden:
-                raise ValueError(f"Forbidden {view}-view features: {forbidden}")
-            frames[view] = structured
-        invariants = ["subject_id", "post_discharge_observed", *LABELS.values()]
-        if not frames["early"][invariants].equals(frames["discharge"][invariants]):
-            raise ValueError("Early and discharge structured views have different subjects or labels")
-
-        reference = frames["early"]
-        self.ids = reference.subject_id.astype(np.int64).to_numpy()
-        self.labels = {task: reference[column].astype(np.float32).to_numpy() for task, column in LABELS.items()}
-        # The legacy  cohort predates the explicit 90-day readmission label.
-        # Keep a conservative compatibility target; the relationship-aware
-        # holdout pipeline requires the native  label below.
-        self.auxiliary_labels = {
-            "readmission_90d": np.maximum(
-                self.labels["readmission"], self.labels["icu"],
-            ).astype(np.float32),
-        }
-        self.post_observed = reference.post_discharge_observed.astype(np.float32).to_numpy()
-        for name, values in {**self.labels, "post_observed": self.post_observed}.items():
-            unique = set(np.unique(values).tolist())
-            if not np.isfinite(values).all() or not unique.issubset({0.0, 1.0}):
-                raise ValueError(f"{name} must be a finite binary variable; found {sorted(unique)}")
-        if not np.array_equal(self.post_observed, 1.0 - self.labels["mortality"]):
-            raise ValueError("post_discharge_observed must equal 1 - in_hospital_mortality")
-        exclude = {"subject_id", "post_discharge_observed", *LABELS.values(), *AUXILIARY_LABELS.values()}
-        self.feature_names_by_view: Dict[str, List[str]] = {}
-        self.struct_raw_by_view: Dict[str, np.ndarray] = {}
-        for view, structured in frames.items():
-            feature_frame = structured[[c for c in structured.columns if c not in exclude]].copy()
-            object_columns = feature_frame.select_dtypes(exclude=[np.number, "bool"]).columns.tolist()
-            if object_columns:
-                raise ValueError(f"{view} structured view contains non-numeric columns: {object_columns[:10]}")
-            self.feature_names_by_view[view] = feature_frame.columns.tolist()
-            self.struct_raw_by_view[view] = feature_frame.astype(np.float32).to_numpy()
-        # Compatibility aliases point to the post-discharge view.  New code
-        # must call structured_view_for_task/fit_struct_transform with a task.
-        self.feature_names = self.feature_names_by_view["discharge"]
-        self.struct_raw = self.struct_raw_by_view["discharge"]
-
-        self.img, has_img = load_embedding_matrix(root / "cxr_embeddings_aggregated.csv", self.ids, "agg_embedding")
-        self.img_early, has_img_early = load_embedding_matrix(root / "cxr_embeddings_early_aggregated.csv", self.ids, "agg_embedding")
-        self.text, has_text = load_embedding_matrix(root / "patient_text_embeddings.csv", self.ids, "discharge_embedding")
-        self.rad, has_rad = load_embedding_matrix(root / "patient_text_embeddings.csv", self.ids, "radiology_embedding")
-        self.rad_early, has_rad_early = load_embedding_matrix(root / "patient_text_embeddings.csv", self.ids, "radiology_early_embedding")
-        if self.img_early.shape[1] != self.img.shape[1] or self.rad_early.shape[1] != self.rad.shape[1]:
-            raise ValueError("Early and hospital-course embedding dimensions must match")
-        if (has_img_early > has_img).any() or (has_rad_early > has_rad).any():
-            raise ValueError("Landmark image/report availability must be a subset of hospital-course availability")
-        self.flags = np.column_stack([np.ones(len(self.ids)), has_img, has_text, has_rad]).astype(np.float32)
-        self.mortality_flags = np.column_stack([
-            np.ones(len(self.ids)), has_img_early, np.zeros(len(self.ids)), has_rad_early,
-        ]).astype(np.float32)
-        self.pattern = (self.flags * np.array([8, 4, 2, 1], dtype=np.float32)).sum(1).astype(np.int64)
-        self.mortality_pattern = (self.mortality_flags * np.array([8, 4, 2, 1], dtype=np.float32)).sum(1).astype(np.int64)
-        print(
-            f"Loaded {len(self.ids)} subjects; structured_dim="
-            f"early:{self.struct_raw_by_view['early'].shape[1]}/"
-            f"discharge:{self.struct_raw_by_view['discharge'].shape[1]}, "
-            f"CXR={int(has_img.sum())}/{int(has_img_early.sum())} post/early, "
-            f"discharge={int(has_text.sum())}, "
-            f"radiology={int(has_rad.sum())}/{int(has_rad_early.sum())} post/early"
-        )
+        self._load_post_discharge(Path(data_dir), post_view)
 
     def _load_post_discharge(self, root: Path, post_view: str) -> None:
         # All post-discharge tasks share the same patient split.
@@ -259,6 +159,8 @@ class DataBundle:
             or view_metadata.get("view") != post_view
         ):
             raise ValueError(f"{metadata_path} is not the expected post-discharge view")
+        if view_metadata.get("mortality_outcome") != MORTALITY_DEFINITION:
+            raise ValueError("Mortality labels are stale; rebuild discharge features with preprocess.sh")
         fingerprint = view_metadata.get("cohort_fingerprint")
         if not isinstance(fingerprint, str) or not fingerprint:
             raise ValueError("Post-discharge preprocessing metadata has no fingerprint")
@@ -285,7 +187,7 @@ class DataBundle:
             raise ValueError(f"{data_path} contains duplicate subjects")
         forbidden = [
             column for column in structured
-            if any(token in column.lower() for token in ("deathtime", "hospital_expire_flag"))
+            if any(token in column.lower() for token in ("deathtime", "hospital_expire_flag", "death_date", "dod"))
         ]
         if forbidden:
             raise ValueError(f"Post-discharge view contains forbidden columns: {forbidden}")
@@ -299,6 +201,9 @@ class DataBundle:
             name: structured[column].astype(np.float32).to_numpy()
             for name, column in AUXILIARY_LABELS.items()
         }
+        for name, values in {**self.labels, **self.auxiliary_labels}.items():
+            if not np.isfinite(values).all() or not set(np.unique(values)).issubset({0.0, 1.0}):
+                raise ValueError(f"{name} must be a finite binary outcome")
         if (self.labels["icu"] > self.auxiliary_labels["readmission_90d"]).any():
             raise ValueError("ICU labels must be a subset of 90-day readmission labels")
         self.post_observed = structured.post_discharge_observed.astype(np.float32).to_numpy()
@@ -327,18 +232,10 @@ class DataBundle:
         self.rad, has_rad = load_embedding_matrix(
             text_path, self.ids, f"radiology_{post_view}_embedding",
         )
-        # FoldDataset retains the four-array contract. These aliases are never
-        # used by a post-discharge active task as mortality uses another data directory.
-        self.img_early = self.img.copy()
-        self.rad_early = self.rad.copy()
         self.flags = np.column_stack([
             np.ones(len(self.ids)), has_img, has_text, has_rad,
         ]).astype(np.float32)
-        self.mortality_flags = np.column_stack([
-            np.ones(len(self.ids)), np.zeros((len(self.ids), 3), dtype=np.float32),
-        ]).astype(np.float32)
         self.pattern = (self.flags * np.array([8, 4, 2, 1], dtype=np.float32)).sum(1).astype(np.int64)
-        self.mortality_pattern = np.full(len(self.ids), 8, dtype=np.int64)
         print(
             f"Loaded post-discharge  {post_view} view: {len(self.ids)} subjects; "
             f"structured_dim={self.struct_raw.shape[1]}, CXR={int(has_img.sum())}, "
@@ -348,8 +245,6 @@ class DataBundle:
     def structured_view_for_task(self, task: str) -> str:
         if task not in TASKS:
             raise ValueError(f"Unknown task: {task}")
-        if task == "mortality":
-            return "early"
         return self.post_view if self.post_view in self.struct_raw_by_view else "discharge"
 
     def raw_structured_for_task(self, task: str) -> Tuple[np.ndarray, List[str]]:
@@ -417,17 +312,30 @@ class FoldDataset(Dataset):
         return combined / np.sum(combined) * len(combined)
 
     def epoch_view(self, positions: Sequence[int], context: FoldDataset, cfg: TrainConfig):
-        if cfg.task == "mortality":
-            raise ValueError("Epoch views require a post-discharge task")
+        policy = cfg.reader_policy
         weights = self.row_weights()
         reference = context.indices
         labels = self.bundle.labels[cfg.task]
-        rng = np.random.default_rng(cfg.index_seed)
+        rng = np.random.default_rng(policy.seed)
+        priority = None
+        if policy.projection > 0.0:
+            with threadpool_limits(limits=max(1, cfg.workers)), warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=ConvergenceWarning, module=r"sklearn\.linear_model\._logistic")
+                estimator = LogisticRegression(
+                    C=0.1, max_iter=300, class_weight="balanced", random_state=policy.seed,
+                )
+                estimator.fit(self.struct[self.indices], labels[self.indices].astype(int))
+                priority = estimator.predict_proba(self.struct)[:, 1]
         retained = []
         for label in (1, 0):
             candidates = np.sort(reference[labels[reference] == label])
             ordered = rng.permutation(candidates)
-            fraction = cfg.class_keep[label]
+            if priority is not None:
+                ranks = np.empty(len(ordered), dtype=float)
+                ranks[np.argsort(priority[ordered], kind="stable")] = np.linspace(0.0, 1.0, len(ordered))
+                keys = (1.0 - policy.projection) * np.linspace(0.0, 1.0, len(ordered)) + policy.projection * ranks
+                ordered = ordered[np.argsort(keys, kind="stable")]
+            fraction = policy.coverage[label]
             size = int(np.floor(len(candidates) * fraction + .5))
             retained.extend(ordered[:size].tolist())
         retained = np.asarray(sorted(retained), dtype=np.int64)
@@ -435,7 +343,7 @@ class FoldDataset(Dataset):
         offsets = np.asarray(positions, dtype=np.int64)
         rows = np.sort(np.concatenate([offsets[offsets < bounds], retained]))
         row_weights = np.take(np.asarray(weights, dtype=np.float64), rows, mode="wrap")
-        index = EpochIndex(rows, row_weights, cfg.epoch_size, cfg.seed)
+        index = EpochIndex(rows, row_weights, policy.draws, cfg.seed)
         dataset = FoldDataset(self.bundle, self.struct, np.arange(len(self.bundle.ids)))
         return dataset, index
 
@@ -446,12 +354,9 @@ class FoldDataset(Dataset):
             "subject_id": torch.tensor(int(self.bundle.ids[idx]), dtype=torch.long),
             "struct": torch.from_numpy(self.struct[idx]),
             "img": torch.from_numpy(self.bundle.img[idx]),
-            "img_early": torch.from_numpy(self.bundle.img_early[idx]),
             "text": torch.from_numpy(self.bundle.text[idx]),
             "rad": torch.from_numpy(self.bundle.rad[idx]),
-            "rad_early": torch.from_numpy(self.bundle.rad_early[idx]),
             "flags": torch.from_numpy(self.bundle.flags[idx]),
-            "mortality_flags": torch.from_numpy(self.bundle.mortality_flags[idx]),
             "readmission": torch.tensor([self.bundle.labels["readmission"][idx]], dtype=torch.float32),
             "readmission_90d": torch.tensor(
                 [self.bundle.auxiliary_labels["readmission_90d"][idx]], dtype=torch.float32,
@@ -486,6 +391,48 @@ class EpochIndex(Sampler):
             yield int(self.rows[position])
 
 
+class BatchReader:
+    """Keep a reader snapshot and its catalogue binding."""
+
+    def __init__(self, catalogue, key, snapshot):
+        self.catalogue = catalogue
+        self.key = key
+        self.snapshot = snapshot
+
+    @property
+    def dataset(self) -> FoldDataset:
+        return self.catalogue[self.key].dataset
+
+    def measure(self, model, device, cfg, offset, resident=False):
+        reader = self.snapshot if resident else self.catalogue[self.key]
+        return evaluate_task(model, reader, device, cfg, seed_offset=offset)
+
+
+class ReaderCatalogue:
+    """Construct and reuse batch readers for array-backed views."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._entries = {}
+        self._options = {
+            "num_workers": cfg.workers,
+            "pin_memory": torch.cuda.is_available(),
+            "persistent_workers": cfg.workers > 0,
+        }
+
+    def __getitem__(self, key):
+        return self._entries[key]
+
+    def bind(self, dataset, training=False, sampler=None) -> BatchReader:
+        key = (dataset.storage_key, training)
+        reader = DataLoader(
+            dataset, batch_size=self.cfg.batch_size,
+            shuffle=training and sampler is None, sampler=sampler, **self._options,
+        )
+        self._entries[key] = reader
+        return BatchReader(self, key, reader)
+
+
 class DataViews:
     """Manage dataset views and their batch readers."""
 
@@ -494,50 +441,31 @@ class DataViews:
         active: np.ndarray, cfg: TrainConfig,
     ):
         self.cfg = cfg
-        self._options = {
-            "num_workers": cfg.workers,
-            "pin_memory": torch.cuda.is_available(),
-            "persistent_workers": cfg.workers > 0,
-        }
-        self._reader_cache = {}
-        self._readers = []
+        self._catalogue = ReaderCatalogue(cfg)
+        self._slots = []
         for position, rows in enumerate(partitions):
             dataset = FoldDataset(bundle, struct, active if position == 0 else rows)
-            self._readers.append(self._make_reader(dataset, position == 0))
-        self.supervised = self._readers[0]
-        self.index = None
-        if cfg.task != "mortality":
-            local = self._readers[1].dataset
-            context = self._reader_cache[(local.storage_key, False)].dataset
-            positions = np.concatenate([self._readers[0].dataset.indices, local.indices])
-            dataset, self.index = self._readers[0].dataset.epoch_view(positions, context, cfg)
-            self.supervised = self._make_reader(dataset, True, sampler=self.index)
-
-    def _make_reader(self, dataset: FoldDataset, training: bool, sampler=None) -> DataLoader:
-        reader = DataLoader(
-            dataset, batch_size=self.cfg.batch_size,
-            shuffle=training and sampler is None, sampler=sampler, **self._options,
-        )
-        self._reader_cache[(dataset.storage_key, training)] = reader
-        return reader
+            self._slots.append(self._catalogue.bind(dataset, position == 0))
+        source = self._slots[0].snapshot.dataset
+        resident = self._slots[1].snapshot.dataset
+        positions = np.concatenate([source.indices, resident.indices])
+        dataset, self.index = source.epoch_view(positions, self._slots[1].dataset, cfg)
+        self.supervised = self._catalogue.bind(dataset, True, self.index).snapshot
 
     @property
     def warmup(self) -> DataLoader:
-        return self._readers[0]
+        return self._slots[0].snapshot
 
     def validation(self, model, device) -> Tuple[Dict[str, float], float]:
-        reader = self._readers[1]
-        metrics, _ = evaluate_task(model, reader, device, self.cfg, seed_offset=17)
-        score_metrics = metrics
-        if self.index is not None:
-            reader = self._reader_cache[(reader.dataset.storage_key, False)]
-            score_metrics, _ = evaluate_task(model, reader, device, self.cfg, seed_offset=29)
-        return metrics, checkpoint_score(score_metrics, self.cfg.task)
+        view = self._slots[1]
+        metrics, _ = view.measure(model, device, self.cfg, 17, resident=True)
+        report, _ = view.measure(model, device, self.cfg, 29)
+        return metrics, checkpoint_score(report, self.cfg.task)
 
     def predictions(self, model, device):
         return tuple(
-            evaluate_task(model, reader, device, self.cfg, seed_offset=offset)
-            for reader, offset in zip(self._readers[1:], (23, 29))
+            view.measure(model, device, self.cfg, offset, resident=True)
+            for view, offset in zip(self._slots[1:], (23, 29))
         )
 
 
@@ -595,6 +523,10 @@ class CRLMMNARFinal(nn.Module):
         self.cfg = cfg
         self.encoders = nn.ModuleList([ModalityEncoder(dim, cfg.hidden_dim, cfg.dropout) for dim in input_dims])
         self.fusion = MissingnessAwareFusion(cfg.hidden_dim, cfg.attention_heads, cfg.dropout)
+        # Preserve the official model's direct [S, I, T, R, z] path.  A
+        # learnable residual blend lets the existing attention representation
+        # remain the stable starting point while the concatenation path earns a
+        # larger or smaller contribution during training.
         self.initial_fusion = nn.Sequential(
             nn.Linear(cfg.hidden_dim * 5, cfg.hidden_dim * 2),
             nn.LayerNorm(cfg.hidden_dim * 2), nn.GELU(), nn.Dropout(cfg.dropout),
@@ -625,10 +557,6 @@ class CRLMMNARFinal(nn.Module):
             task: nn.Sequential(nn.Linear(cfg.hidden_dim, cfg.hidden_dim // 2), nn.GELU(), nn.Dropout(cfg.dropout / 2), nn.Linear(cfg.hidden_dim // 2, 1))
             for task in TASKS
         })
-        # Relationship heads do not merge the task-specific training runs.
-        # Each task model learns its own 90-day readmission gate and an ICU
-        # severity conditional, which supplies clinically structured auxiliary
-        # supervision without sharing parameters with the mortality model.
         self.relationship_heads = nn.ModuleDict({
             name: nn.Sequential(
                 nn.Linear(cfg.hidden_dim, cfg.hidden_dim // 2), nn.GELU(),
@@ -687,8 +615,6 @@ class CRLMMNARFinal(nn.Module):
         self,
         values: Sequence[torch.Tensor],
         flags: torch.Tensor,
-        mortality_values: Sequence[torch.Tensor],
-        mortality_flags: torch.Tensor,
         compute_aux: bool = False,
     ) -> Dict[str, object]:
         encoded = self.encode(values)
@@ -696,13 +622,9 @@ class CRLMMNARFinal(nn.Module):
         outputs: Dict[str, object] = {
             "readmission": self.task_logit("readmission", h_post),
             "icu": self.task_logit("icu", h_post),
+            "mortality": self.task_logit("mortality", h_post),
             "missing_logits": missing_logits,
         }
-        # Discharge summaries occur after the in-hospital mortality outcome and
-        # are therefore never visible to the mortality branch.
-        mortality_encoded = self.encode(mortality_values)
-        h_mort, _ = self.fuse_encoded(mortality_encoded, mortality_flags)
-        outputs["mortality"] = self.task_logit("mortality", h_mort)
         if compute_aux:
             outputs["auxiliary"] = self.auxiliary(encoded, flags, missing_logits)
         return outputs
@@ -745,6 +667,9 @@ class CRLMMNARFinal(nn.Module):
         reconstruction_terms: List[torch.Tensor] = []
         contrastive_terms: List[torch.Tensor] = []
         for modality in range(4):
+            # Exhaustive leave-one-observed-modality-out is the deterministic
+            # minibatch estimator of Algorithm 2 and gives rare CXR patterns
+            # enough positives for stable InfoNCE.
             selected = eligible & flags[:, modality].bool()
             if not selected.any():
                 continue
@@ -794,22 +719,13 @@ def active_batch_to_device(
     batch: Dict[str, torch.Tensor], device: torch.device, cfg: TrainConfig,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     struct = batch["struct"].to(device, non_blocking=True)
-    if cfg.task == "mortality":
-        values = [
-            struct,
-            batch["img_early"].to(device, non_blocking=True),
-            torch.zeros_like(batch["text"].to(device, non_blocking=True)),
-            batch["rad_early"].to(device, non_blocking=True),
-        ]
-        flags = batch["mortality_flags"].to(device, non_blocking=True).clone()
-    else:
-        values = [
-            struct,
-            batch["img"].to(device, non_blocking=True),
-            batch["text"].to(device, non_blocking=True),
-            batch["rad"].to(device, non_blocking=True),
-        ]
-        flags = batch["flags"].to(device, non_blocking=True).clone()
+    values = [
+        struct,
+        batch["img"].to(device, non_blocking=True),
+        batch["text"].to(device, non_blocking=True),
+        batch["rad"].to(device, non_blocking=True),
+    ]
+    flags = batch["flags"].to(device, non_blocking=True).clone()
     allowed = set(cfg.modality_set)
     for index, modality in enumerate("sitr"):
         if modality not in allowed:
@@ -868,7 +784,11 @@ def evaluate_task(
 
 
 def checkpoint_score(metrics: Dict[str, float], task: str) -> float:
-    return 0.7 * metrics[f"{task}_auc"] + 0.3 * metrics[f"{task}_auprc"]
+    return sum(
+        weight * metrics[f"{task}_{metric}"]
+        for weight, metric in zip(ReaderPolicy.for_task(task).criterion, ("auc", "auprc"))
+        if weight
+    )
 
 
 def safe_metric(function, targets: np.ndarray, predictions: np.ndarray) -> float:
@@ -882,12 +802,9 @@ def composite_strata(
 ) -> np.ndarray:
     """Build task-specific strata while retaining risk-set and MMNAR balance."""
     target = bundle.labels[task][indices].astype(int)
-    observed = (
-        np.ones(len(indices), dtype=int)
-        if task == "mortality" else bundle.post_observed[indices].astype(int)
-    )
-    pattern = bundle.mortality_pattern[indices] if task == "mortality" else bundle.pattern[indices]
-    complete_pattern = pattern == (13 if task == "mortality" else 15)
+    observed = bundle.post_observed[indices].astype(int)
+    pattern = bundle.pattern[indices]
+    complete_pattern = pattern == 15
     candidates = []
     if bundle.split_on_missingness:
         candidates.append(np.column_stack([target, observed, complete_pattern.astype(int)]))
@@ -921,25 +838,18 @@ def relationship_strata(bundle: DataBundle, indices: np.ndarray, minimum: int) -
 
 def make_splits(bundle: DataBundle, cfg: TrainConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     all_indices = np.arange(len(bundle.ids))
-    if cfg.task == "mortality":
-        strata = composite_strata(bundle, all_indices, minimum=5, task=cfg.task)
-    else:
-        strata = relationship_strata(bundle, all_indices, minimum=5)
+    strata = relationship_strata(bundle, all_indices, minimum=5)
     train_val, test = train_test_split(
         all_indices, test_size=0.20, random_state=cfg.seed, stratify=strata,
     )
-    if cfg.task == "mortality":
-        inner_strata = composite_strata(bundle, train_val, minimum=2, task=cfg.task)
-    else:
-        inner_strata = relationship_strata(bundle, train_val, minimum=2)
+    inner_strata = relationship_strata(bundle, train_val, minimum=2)
     train, validation = train_test_split(
         train_val, test_size=0.15, random_state=cfg.seed, stratify=inner_strata,
     )
     if set(train) & set(validation) or set(train) & set(test) or set(validation) & set(test):
         raise RuntimeError("Subject split overlap detected")
     for split_name, split in (("train", train), ("validation", validation), ("test", test)):
-        tasks = ("mortality",) if cfg.task == "mortality" else ("readmission", "icu")
-        for task in tasks:
+        for task in TASKS:
             if set(np.unique(bundle.labels[task][split]).tolist()) != {0.0, 1.0}:
                 raise ValueError(f"{split_name} holdout has fewer than two {task} classes")
     return np.asarray(train), np.asarray(validation), np.asarray(test)
@@ -949,13 +859,13 @@ def pretrain(model: CRLMMNARFinal, loader: DataLoader, cfg: TrainConfig, device:
     if cfg.pretrain_epochs <= 0:
         return
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     for epoch in range(1, cfg.pretrain_epochs + 1):
         model.train(); total = 0.0; seen = 0
         for batch in loader:
             values, flags = active_batch_to_device(batch, device, cfg)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 encoded = model.encode(values)
                 _, missing_logits = model.fuse_encoded(encoded, flags)
                 loss = model.auxiliary(encoded, flags, missing_logits)["total"]
@@ -1008,14 +918,14 @@ def train_final(model: CRLMMNARFinal, train_loader: DataLoader, views: DataViews
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(cfg.epochs, 1), eta_min=cfg.learning_rate * 0.05)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     best_score = -math.inf; no_improvement = 0; best_metrics: Dict[str, float] = {}
     for epoch in range(1, cfg.epochs + 1):
         model.train(); running = 0.0; relationship_running = 0.0; seen = 0
         for batch in train_loader:
             values, flags = active_batch_to_device(batch, device, cfg)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 compute_aux = cfg.aux_weight > 0.0 and cfg.aux_anneal_epochs > 0 and epoch <= cfg.aux_anneal_epochs
                 outputs = model.forward_active(values, flags, cfg.task, compute_aux=compute_aux)
                 targets = batch[cfg.task].to(device)
@@ -1038,14 +948,14 @@ def train_final(model: CRLMMNARFinal, train_loader: DataLoader, views: DataViews
         metrics, score = views.validation(model, device)
         print(
             f"epoch {epoch:03d}: loss={running / max(seen, 1):.6f}, "
-            f"aux_weight={auxiliary_weight:.6f}, lr={scheduler.get_last_lr()[0]:.8f}, "
-            f"relationship_loss={relationship_running / max(seen, 1):.6f}, "
-            f"metrics={json.dumps(metrics)}"
+            f"lr={scheduler.get_last_lr()[0]:.8f}"
         )
         if score > best_score + 1e-5:
             best_score, no_improvement, best_metrics = score, 0, metrics
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             payload = {"model": model.state_dict(), "config": asdict(cfg), "epoch": epoch, "validation_metrics": metrics}
+            if cfg.task == "mortality":
+                payload["target"] = MORTALITY_LABEL
             torch.save(payload, checkpoint)
         else:
             no_improvement += 1
@@ -1099,6 +1009,8 @@ def run_task(cfg: TrainConfig) -> TaskResult:
         ("best_validation", "reloaded_validation", "test_holdout"),
         (best_validation, *(metrics for metrics, _ in results)),
     ))
+    if cfg.task == "mortality":
+        metric_payload["target"] = MORTALITY_LABEL
     (run_dir / "metrics.json").write_text(json.dumps(metric_payload, indent=2), encoding="utf-8")
     print(json.dumps(results[-1][0], indent=2))
     return TaskResult(metric_payload, tuple(frame for _, frame in results))

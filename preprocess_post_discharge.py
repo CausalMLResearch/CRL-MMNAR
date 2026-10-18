@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hospital-discharge preprocessing for readmission and future ICU outcomes."""
+"""Prepare a common discharge cohort for readmission, ICU and mortality."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 
 import preprocess_common as core
+from preprocess_mortality import MORTALITY_DEFINITION, MORTALITY_LABEL, derive_mortality_labels
 
 
 PIPELINE = "post_discharge"
@@ -34,11 +35,6 @@ def cohort_payload(args: SimpleNamespace) -> Dict[str, object]:
         "cohort_size": int(args.cohort_size),
         "random_seed": int(args.random_seed),
         "prediction_landmark": "index_discharge",
-        "complete_note_grace_hours": int(args.note_grace_hours),
-        "selection": (
-            "adult first hospital admission per subject; survived index admission; "
-            "no post-discharge washout or outcome-dependent exclusion"
-        ),
     }
 
 
@@ -234,7 +230,7 @@ def build_cohort(args: SimpleNamespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.
     # It is never used as an input feature.
     cohort["readmission_90d"] = cohort.subject_id.astype(int).isin(readmit_90_ids).astype(np.int8)
     cohort["icu_need_after_discharge_90d"] = cohort.subject_id.astype(int).isin(icu_ids).astype(np.int8)
-    cohort["in_hospital_mortality"] = np.int8(0)
+    cohort[MORTALITY_LABEL] = derive_mortality_labels(cohort, patients)
     cohort["post_discharge_observed"] = np.int8(1)
     if (cohort.icu_need_after_discharge_90d > cohort.readmission_90d).any():
         raise RuntimeError("An ICU-after-discharge outcome has no matching 90-day readmission")
@@ -347,7 +343,7 @@ def build_structured_view(
     )
     labels = indexed[[
         "readmission_30d", "readmission_90d", "icu_need_after_discharge_90d",
-        "in_hospital_mortality", "post_discharge_observed",
+        MORTALITY_LABEL, "post_discharge_observed",
     ]]
     print(f"Aggregating post-discharge {view} labs")
     labs = core.aggregate_mapped_numeric(table_path(args, "hosp", "labevents"), window, core.LAB_SPECS, args.csv_chunksize, "hosp")
@@ -382,7 +378,7 @@ def build_structured_view(
     features[count_like] = features[count_like].fillna(0)
     if features.index.duplicated().any() or len(features) != len(cohort):
         raise RuntimeError(f"{view} view lost post-discharge subjects")
-    forbidden = [column for column in features if any(token in column.lower() for token in ("deathtime", "hospital_expire_flag"))]
+    forbidden = [column for column in features if any(token in column.lower() for token in ("deathtime", "hospital_expire_flag", "death_date", "dod"))]
     if forbidden:
         raise RuntimeError(f"Post-outcome feature columns detected: {forbidden}")
     return features, groups
@@ -403,12 +399,13 @@ def structured_stage(args: SimpleNamespace) -> None:
             **metadata(args), "structured_pipeline": STRUCTURED_PIPELINE, "view": view,
             "rows": len(features), "columns": len(features.columns), "feature_groups": groups,
             "clinical_cutoff": "index_discharge",
-            "recorded_availability_cutoff": "not_applied_for_index_admission_events",
             "prediction_landmark": "index_discharge",
+            "mortality_outcome": MORTALITY_DEFINITION,
             "label_prevalence": {
                 "readmission_30d": float(features.readmission_30d.mean()),
                 "readmission_90d": float(features.readmission_90d.mean()),
                 "icu_need_after_discharge_90d": float(features.icu_need_after_discharge_90d.mean()),
+                MORTALITY_LABEL: float(features[MORTALITY_LABEL].mean()),
             },
         }, output / f"{stem}.meta.json")
         print(f"Wrote {path}: {features.shape}")
@@ -420,6 +417,7 @@ def structured_stage(args: SimpleNamespace) -> None:
     os.replace(compatibility_tmp, compatibility)
     core.atomic_write_json({
         **metadata(args), "structured_pipeline": STRUCTURED_PIPELINE, "view": "complete",
+        "mortality_outcome": MORTALITY_DEFINITION,
     }, output / "patient_features.meta.json")
 
 
@@ -431,7 +429,7 @@ def filter_notes(
 ) -> pd.DataFrame:
     core.require_columns(notes, {"subject_id", "hadm_id", "charttime", "storetime", "text"}, kind)
     joined = notes.merge(
-        cohort[["subject_id", "hadm_id", "admittime", "dischtime", "prediction_cutoff"]],
+        cohort[["subject_id", "hadm_id", "admittime", "dischtime"]],
         on=["subject_id", "hadm_id"], how="inner", validate="many_to_one",
     )
     chart = pd.to_datetime(joined.charttime, errors="coerce")
@@ -511,10 +509,6 @@ def text_stage(args: SimpleNamespace) -> None:
     core.atomic_write_json({
         **metadata(args), "text_pipeline": TEXT_PIPELINE, "text_model": args.text_model,
         "embedding_dimension": encoder.hidden_size,
-        "complete_cutoff": (
-            f"index_hadm_charttime_through_discharge_plus_{args.note_grace_hours}h;"
-            "storetime_not_restricted"
-        ),
         "prediction_landmark": "index_discharge",
         **{f"{kind}_subjects": len(outputs[kind]) for kind in kinds},
     }, Path(args.data_dir) / "patient_text_embeddings_post.meta.json")
@@ -537,20 +531,23 @@ def validate_stage(args: SimpleNamespace) -> None:
         raise ValueError("CXR patient identifiers do not match the cohort")
     if not features.post_discharge_observed.eq(1).all():
         raise ValueError("Post-discharge cohort must contain surviving discharges")
-    for label in ("readmission_30d", "readmission_90d", "icu_need_after_discharge_90d"):
+    for label in ("readmission_30d", "readmission_90d", "icu_need_after_discharge_90d", MORTALITY_LABEL):
         if features[label].isna().any() or not set(features[label].unique()).issubset({0, 1}):
             raise ValueError(f"Invalid {label}")
-    forbidden = [c for c in features if "deathtime" in c.lower() or "hospital_expire_flag" in c.lower()]
+    forbidden = [c for c in features if any(token in c.lower() for token in ("deathtime", "hospital_expire_flag", "death_date", "dod"))]
     if forbidden or features.drop(columns="subject_id").select_dtypes(exclude=[np.number, "bool"]).columns.tolist():
         raise ValueError("Structured features contain forbidden or non-numeric columns")
     for stem in ("patient_features_discharge_complete", "patient_text_embeddings_post", "cxr_embeddings_aggregated"):
         payload = json.loads(core.require_file(root / f"{stem}.meta.json").read_text())
         if payload.get("cohort_fingerprint") != cohort_fingerprint(args):
             raise ValueError(f"{stem} belongs to another cohort")
+        if stem == "patient_features_discharge_complete" and payload.get("mortality_outcome") != MORTALITY_DEFINITION:
+            raise ValueError("Structured features have a stale mortality outcome")
     report = {
         "subjects": len(ids), "cohort_fingerprint": cohort_fingerprint(args),
         "readmission_prevalence": float(features.readmission_30d.mean()),
         "icu_prevalence": float(features.icu_need_after_discharge_90d.mean()),
+        "mortality_prevalence": float(features[MORTALITY_LABEL].mean()),
         "cxr": int(cxr.agg_embedding.notna().sum()),
         "discharge_text": int(text.discharge_complete_embedding.notna().sum()),
         "radiology_text": int(text.radiology_complete_embedding.notna().sum()),
